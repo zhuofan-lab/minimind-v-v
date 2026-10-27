@@ -6,3 +6,9 @@ out
 website/
 docs-minimind-v/
 测试.py
+# 训练产物和下载的大文件，避免在 fork 里误提交
+checkpoints/
+dataset/*.parquet
+dataset/*_preview.png
+model/siglip2-base-p32-256-ve/
+.pytest_cache/

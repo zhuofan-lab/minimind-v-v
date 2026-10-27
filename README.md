@@ -33,6 +33,9 @@
 
 </div>
 
+> [!NOTE]
+> 本仓库是 [jingyaogong/minimind-v](https://github.com/jingyaogong/minimind-v) 的分支：在不改变模型结构和权重格式的前提下修复了若干问题（非 RGB 图片导致训练崩溃、相邻多图报错等），加入动态 padding、补充了 CPU 测试。改动清单和后续可改进方向见 [docs/IMPROVEMENTS.md](./docs/IMPROVEMENTS.md)。
+
 * 此项目旨在从0开始，仅用3块钱成本 + 2小时！即可训练出65M参数的超小多模态视觉语言模型**MiniMind-V**。
 * **MiniMind-V**最小版本体积仅为 GPT3 的约 $\frac{1}{2600}$，力求做到个人GPU也可快速推理甚至训练。
 * **MiniMind-V**是[MiniMind](https://github.com/jingyaogong/minimind)纯语言模型的视觉能力额外拓展，同系列多模态Omni模型详见[MiniMind-O](https://github.com/jingyaogong/minimind-o)。
