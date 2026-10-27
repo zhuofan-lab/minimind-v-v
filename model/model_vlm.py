@@ -58,9 +58,17 @@ class MiniMindVLM(MiniMindForCausalLM):
             param.requires_grad = False
         return model.eval(), processor
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # 视觉编码器全程冻结，model.train() 时也保持 eval 模式（不受 dropout 等训练态行为影响）
+        if getattr(self, 'vision_encoder', None) is not None:
+            self.vision_encoder.eval()
+        return self
+
     @staticmethod
     def image2tensor(image, processor):
-        if image.mode in ['RGBA', 'LA']: image = image.convert('RGB')
+        # 灰度(L)/调色板(P)/CMYK/RGBA 等非 RGB 图像会让 SigLIP 预处理直接报错，统一转为 RGB
+        if image.mode != 'RGB': image = image.convert('RGB')
         inputs = processor(images=image, return_tensors="pt")
         return inputs
 
@@ -72,28 +80,26 @@ class MiniMindVLM(MiniMindForCausalLM):
             outputs = vision_model(**image_inputs)
         return outputs.last_hidden_state
 
-    @torch.compiler.disable
-    def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
+    def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=None):
+        """用视觉特征替换图像占位符(<|image_pad|>)位置的 embedding。
+
+        数据中每个 <image> 都被展开成 image_token_len 个连续占位符，所以样本内第 k 个占位符对应
+        第 k // image_token_len 张图的第 k % image_token_len 个视觉 token。
+        全程向量化：没有逐 token 的 Python 循环和 GPU→CPU 同步，序列长度保持不变，
+        相邻的多张图、被截断在序列末尾的图都能正确对齐，也可以直接被 torch.compile 编译。
+        （seqlen 参数仅为兼容旧调用保留，不再使用）
+        """
         if vision_tensors is None or not self.config.image_ids:
             return h
-        marker, vf = self.config.image_ids[0], vision_tensors
-        if vf.dim() == 3:
-            vf = vf.unsqueeze(1)
-        out = []
-        for b in range(h.size(0)):
-            hb, seq, k, i = h[b], tokens[b].tolist(), 0, 0
-            while i < len(seq):
-                if seq[i] == marker:
-                    start = i
-                    while i < len(seq) and seq[i] == marker:
-                        i += 1
-                    if k < vf.size(1):
-                        hb = torch.cat((hb[:start], vf[b][k][:i - start], hb[i:]), dim=0)[:seqlen]
-                        k += 1
-                else:
-                    i += 1
-            out.append(hb)
-        return torch.stack(out)
+        vf = vision_tensors if vision_tensors.dim() == 4 else vision_tensors.unsqueeze(1)  # [B, N_img, L_img, H]
+        num_images, img_len = vf.shape[1], vf.shape[2]
+        is_image = tokens == self.config.image_ids[0]                                      # [B, S]
+        k = is_image.long().cumsum(dim=1) - 1                                               # 占位符在本样本内的序号
+        img_idx, tok_idx = torch.div(k, img_len, rounding_mode='floor'), k % img_len
+        valid = is_image & (img_idx < num_images)                                           # 多于图片数量的占位符保持原 embedding
+        batch_idx = torch.arange(vf.size(0), device=vf.device).unsqueeze(1)
+        feats = vf[batch_idx, img_idx.clamp(0, num_images - 1), tok_idx]                    # [B, S, H]
+        return torch.where(valid.unsqueeze(-1), feats.to(h.dtype), h)
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
@@ -127,9 +133,12 @@ class MiniMindVLM(MiniMindForCausalLM):
             hidden_states = self.count_vision_proj(tokens=input_ids, h=hidden_states, vision_tensors=vision_tensors, seqlen=input_ids.shape[1])
 
         # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
-        if self.model.freqs_cos[0, 0] == 0:
-            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
-            self.model.freqs_cos, self.model.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        # 只在首次前向检查一次：该判断会触发 GPU→CPU 同步，并让 torch.compile 在此处断图
+        if not getattr(self, '_rope_checked', False):
+            if self.model.freqs_cos[0, 0] == 0:
+                freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+                self.model.freqs_cos, self.model.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+            self._rope_checked = True
         position_embeddings = (
             self.model.freqs_cos[start_pos:start_pos + seq_length],
             self.model.freqs_sin[start_pos:start_pos + seq_length]
@@ -157,7 +166,10 @@ class MiniMindVLM(MiniMindForCausalLM):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            # 等价于 mean 归约；区别是整个 batch 都没有监督 token（例如回答被 max_seq_len 整段截掉）时，
+            # mean 会得到 0/0=NaN（梯度本身是 0，不影响权重，但日志和训练曲线里会出现 NaN），这里返回 0
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction='sum')
+            loss = loss / (shift_labels != -100).sum().clamp(min=1)
 
         output = MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=presents, hidden_states=hidden_states)
         return output
