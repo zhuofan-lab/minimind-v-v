@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 from model.model_vlm import MiniMindVLM, VLMConfig
 from dataset.lm_dataset import VLMDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, init_distributed_mode, setup_seed, init_vlm_model, vlm_checkpoint, SkipBatchSampler, vlm_collate_fn
+from trainer.trainer_utils import get_lr, Logger, is_main_process, init_distributed_mode, setup_seed, init_vlm_model, vlm_checkpoint, SkipBatchSampler, vlm_collate_fn, save_weights
 
 warnings.filterwarnings('ignore')
 
@@ -62,18 +62,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.eval()
             moe_suffix = '_moe' if vlm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            clean_state_dict = {
-                key: value for key, value in state_dict.items() if not key.startswith('vision_encoder.')
-            }
-            clean_state_dict = {k: v.half().cpu() for k, v in clean_state_dict.items()}  # 半精度保存并移到CPU
-            torch.save(clean_state_dict, ckp)
+            save_weights(model, ckp)  # 半精度、去掉冻结的vision_encoder、临时文件+原子替换
             vlm_checkpoint(vlm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()
-            del state_dict, clean_state_dict
 
         del input_ids, labels, pixel_values, res, loss
 
@@ -118,7 +110,7 @@ if __name__ == "__main__":
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type, dtype=dtype)
     
     # ========== 4. 配wandb ==========
     wandb = None
@@ -133,7 +125,7 @@ if __name__ == "__main__":
     model, tokenizer, preprocess = init_vlm_model(vlm_config, from_weight=args.from_weight, device=args.device, freeze_llm=args.freeze_llm)
     train_ds = VLMDataset(args.data_path, tokenizer, preprocess=preprocess, image_special_token=vlm_config.image_special_token, image_token_len=vlm_config.image_token_len, max_length=vlm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = torch.amp.GradScaler(device_type, enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
