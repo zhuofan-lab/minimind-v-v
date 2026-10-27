@@ -7,8 +7,9 @@ import random
 from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_vlm import MiniMindVLM, VLMConfig
-from trainer.trainer_utils import setup_seed, get_model_params
+from trainer.trainer_utils import setup_seed, get_model_params, load_vlm_weights
 warnings.filterwarnings('ignore')
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
 
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from, trust_remote_code=True)
@@ -17,13 +18,15 @@ def init_model(args):
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model = MiniMindVLM(
             VLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)),
-            vision_model_path="./model/siglip2-base-p32-256-ve"
+            vision_model_path=args.vision_model
         )
-        state_dict = torch.load(ckp, map_location=args.device)
-        model.load_state_dict({k: v for k, v in state_dict.items() if 'mask' not in k}, strict=False)
+        load_vlm_weights(model, ckp, device=args.device)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
-        model.vision_encoder, model.processor = MiniMindVLM.get_vision_model("./model/siglip2-base-p32-256-ve")
+        model.vision_encoder, model.processor = MiniMindVLM.get_vision_model(args.vision_model)
+    if model.vision_encoder is None:
+        raise FileNotFoundError(f'未找到视觉编码器: {os.path.abspath(args.vision_model)}，'
+                                f'请先下载 siglip2-base-p32-256-ve（见 README「第0步」或 model/model_init.md）')
     get_model_params(model, model.config)
     model = model.eval()
     if "cuda" in args.device: model = model.half()
@@ -42,39 +45,46 @@ def main():
     parser.add_argument('--temperature', default=0.7, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--image_dir', default='./dataset/eval_images/', type=str, help="测试图像目录")
+    parser.add_argument('--image', default=None, type=str, help="只测试单张图像（指定后忽略 --image_dir）")
+    parser.add_argument('--prompt', default="<image>\n请描述这张图中的主要物体和场景。", type=str, help="提问内容，<image> 为图像插入位置（缺省时自动加在开头）")
+    parser.add_argument('--vision_model', default='./model/siglip2-base-p32-256-ve', type=str, help="视觉编码器路径")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     args = parser.parse_args()
-    
+
     model, tokenizer, preprocess = init_model(args)
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    # 自动测试image_dir中的所有图像
-    prompt = "<image>\n请描述这张图中的主要物体和场景。"
+    # 默认自动测试image_dir中的所有图像；也可用 --image / --prompt 测试自己的图片和问题
+    prompt = args.prompt.replace('\\n', '\n')
+    if '<image>' not in prompt: prompt = f'<image>\n{prompt}'
     # prompt = "<image>\nPlease illustrate the image through your words."
-    for image_file in sorted(os.listdir(args.image_dir)):
-        if image_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-            setup_seed(random.randint(1, 31415926))
-            image_path = os.path.join(args.image_dir, image_file)
-            image = Image.open(image_path).convert('RGB')
-            pixel_values = {k: v.to(args.device) for k, v in MiniMindVLM.image2tensor(image, preprocess).items()}
-            
-            messages = [{"role": "user", "content": prompt.replace('<image>', model.config.image_special_token * model.config.image_token_len)}]
-            inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
-            inputs = tokenizer(inputs_text, return_tensors="pt", truncation=True).to(args.device)
-            
-            print(f'[图像]: {image_file}')
-            print(f"💬: {repr(prompt)}")
-            print('🤖: ', end='')
-            st = time.time()
-            generated_ids = model.generate(
-                inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
-                max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-                top_p=args.top_p, temperature=args.temperature, pixel_values=pixel_values
-            )
-            gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
-            print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
+    if args.image:
+        image_paths = [args.image]
+    else:
+        image_paths = [os.path.join(args.image_dir, f) for f in sorted(os.listdir(args.image_dir)) if f.lower().endswith(IMAGE_EXTS)]
+    for image_path in image_paths:
+        image_file = os.path.basename(image_path)
+        setup_seed(random.randint(1, 31415926))
+        image = Image.open(image_path).convert('RGB')
+        pixel_values = {k: v.to(args.device) for k, v in MiniMindVLM.image2tensor(image, preprocess).items()}
+
+        messages = [{"role": "user", "content": prompt.replace('<image>', model.config.image_special_token * model.config.image_token_len)}]
+        inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
+        inputs = tokenizer(inputs_text, return_tensors="pt", truncation=True).to(args.device)
+
+        print(f'[图像]: {image_file}')
+        print(f"💬: {repr(prompt)}")
+        print('🤖: ', end='')
+        st = time.time()
+        generated_ids = model.generate(
+            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+            max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
+            pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+            top_p=args.top_p, temperature=args.temperature, pixel_values=pixel_values
+        )
+        gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
+        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
 
 if __name__ == "__main__":
     main()
