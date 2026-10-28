@@ -52,12 +52,35 @@ class VLMDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.preprocess = preprocess
+        self.image_token_len = image_token_len
         self.image_special_token = image_special_token * image_token_len
-        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        # 回答片段的起止标记（ChatML 格式）。MiniMind 的 bos/eos 就是 <|im_start|>/<|im_end|>，两种写法完全等价；
+        # 直接写死是因为 Qwen 等模型的 bos_token 为 None、基座版本的 eos_token 是 <|endoftext|>，用 bos/eos 拼会找不到回答
+        self.bos_id = tokenizer('<|im_start|>assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer('<|im_end|>\n', add_special_tokens=False).input_ids
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.convert_tokens_to_ids('<|im_end|>')
 
     def __len__(self):
         return len(self.dataset)
+
+    def estimate_lengths(self):
+        """粗略估计每条样本的 token 数（不做分词，几秒内算完几百万条），供按长度分组采样使用。
+
+        conversations 是 JSON 字符串，中文可能存成原文（UTF-8 3 字节）或 \\uXXXX 转义（6 个字符），两种都考虑；
+        按中文约 1.5 字/token、英文约 4 字符/token 估算，再加上每张图的 image_token_len 个视觉 token。
+        """
+        import pyarrow.compute as pc
+        col = self.dataset.data.column('conversations')
+        if not pa.types.is_string(col.type) and not pa.types.is_large_string(col.type):
+            return [len(json.dumps(c, ensure_ascii=False)) // 2 for c in col.to_pylist()]
+        chars = pc.utf8_length(col).to_numpy(zero_copy_only=False).astype('float64')
+        nbytes = pc.binary_length(col).to_numpy(zero_copy_only=False).astype('float64')
+        escaped = pc.count_substring(col, '\\u').to_numpy(zero_copy_only=False).astype('float64')
+        images = pc.count_substring(col, '<image>').to_numpy(zero_copy_only=False).astype('float64')
+        cjk = (nbytes - chars) / 2 + escaped               # 非 ASCII 字符（按 3 字节估）+ 转义的字符
+        ascii_chars = chars - (nbytes - chars) / 2 - 6 * escaped - 7 * images
+        tokens = ascii_chars.clip(min=0) / 4 + cjk / 1.5 + images * self.image_token_len
+        return tokens.clip(min=1, max=self.max_length).astype('int64').tolist()
 
     def create_chat_prompt(self, conversations):
         messages = []
@@ -100,7 +123,7 @@ class VLMDataset(Dataset):
         prompt = self.create_chat_prompt(conversations)
         prompt = post_processing_chat(prompt)
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        input_ids += [self.pad_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)
 
         image_inputs_list = [MiniMindVLM.image2tensor(Image.open(io.BytesIO(img)), self.preprocess) for img in image_bytes]

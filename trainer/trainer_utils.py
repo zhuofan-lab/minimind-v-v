@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_vlm import MiniMindVLM
+from model.model_vlm_hf import HFVLM, lora_rank_in
 
 
 def get_model_params(model, config, ignore_patterns=['vision_encoder']):
@@ -46,10 +47,13 @@ def get_lr(current_step, total_steps, lr):
 def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
-    
-    dist.init_process_group(backend="nccl")
+
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    else:  # 没有 GPU 时用 gloo 后端，可以在 CPU 上调试多卡逻辑（torchrun --nproc_per_node 2 ... --device cpu）
+        dist.init_process_group(backend="gloo")
     return local_rank
 
 
@@ -69,14 +73,32 @@ def unwrap_model(model):
     return getattr(model, '_orig_mod', model)
 
 
+def weight_tag(config):
+    """权重文件名中的模型标记：MiniMind 主干为 {hidden_size}[_moe]（如 768、768_moe），HF 主干为模型目录名（如 qwen3-0.6b）"""
+    return getattr(config, 'llm_tag', None) or f"{config.hidden_size}{'_moe' if config.use_moe else ''}"
+
+
+def resolve_weight_path(save_dir, from_weight, config):
+    """--from_weight 既可以是前缀名（pretrain_vlm → {save_dir}/pretrain_vlm_{tag}.pth），也可以直接给 .pth 路径"""
+    if from_weight.endswith('.pth') or os.path.isfile(from_weight):
+        return from_weight
+    return f'{save_dir}/{from_weight}_{weight_tag(config)}.pth'
+
+
 def get_vlm_state_dict(model):
-    """不含 vision_encoder 的 state_dict：视觉编码器全程冻结、可以从磁盘重新加载，没必要每次都存一遍（~95M 参数）。"""
-    return {k: v for k, v in unwrap_model(model).state_dict().items() if not k.startswith('vision_encoder.')}
+    """需要保存的参数，不含冻结的 vision_encoder（可以从磁盘重新加载，没必要每次都存一遍，~95M 参数）。
+    HF 主干（Qwen 等）只保存与基座模型不同的部分，见 HFVLM.vlm_state_dict。"""
+    raw = unwrap_model(model)
+    if hasattr(raw, 'vlm_state_dict'):
+        return raw.vlm_state_dict()
+    return {k: v for k, v in raw.state_dict().items() if not k.startswith('vision_encoder.')}
 
 
 def save_weights(model, path):
-    """半精度保存模型权重（不含 vision_encoder）；先写临时文件再原子替换，防止保存中断导致权重损坏。"""
-    state_dict = {k: v.half().cpu() for k, v in get_vlm_state_dict(model).items()}
+    """半精度保存模型权重（不含 vision_encoder）；先写临时文件再原子替换，防止保存中断导致权重损坏。
+    MiniMind 主干沿用 fp16；HF 主干本身是 bf16 训练的，用 bf16 保存避免很小的权重在 fp16 下下溢。"""
+    dtype = torch.bfloat16 if isinstance(unwrap_model(model), HFVLM) else torch.float16
+    state_dict = {k: v.to(dtype).cpu() for k, v in get_vlm_state_dict(model).items()}
     tmp_path = path + '.tmp'
     torch.save(state_dict, tmp_path)
     os.replace(tmp_path, path)
@@ -90,8 +112,14 @@ def load_vlm_weights(model, weight_path, device='cpu'):
     """
     weights = torch.load(weight_path, map_location=device)
     weights = {k: v for k, v in weights.items() if 'mask' not in k}  # 兼容旧版权重里的 attention mask buffer
+    is_hf = isinstance(model, HFVLM)
+    if is_hf and lora_rank_in(weights):  # 权重里有 LoRA：先挂上同样秩的 LoRA 再加载
+        model.apply_lora(lora_rank_in(weights))
     missing, unexpected = model.load_state_dict(weights, strict=False)
     missing = [k for k in missing if not k.startswith('vision_encoder.')]  # 视觉编码器单独从磁盘加载
+    if is_hf:  # HF 主干的权重只含与基座不同的部分，其余参数来自 llm_path，不算缺失
+        model.loaded_keys |= set(weights) - set(unexpected)
+        missing = [k for k in missing if k.startswith('vision_proj.')]
     def preview(keys): return f"{keys[:6]}{' ...' if len(keys) > 6 else ''}"
     if missing and all(k.startswith('vision_proj.') for k in missing):
         Logger(f'{weight_path} 中没有 vision_proj 参数，Projector 将随机初始化（从纯 LLM 权重开始训练时属正常）')
@@ -102,17 +130,33 @@ def load_vlm_weights(model, weight_path, device='cpu'):
     return model
 
 
-def init_vlm_model(vlm_config, from_weight='pretrain_vlm', tokenizer_path='../model', vision_model_path='../model/siglip2-base-p32-256-ve', save_dir='../out', device='cuda', freeze_llm=0):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindVLM(vlm_config, vision_model_path=vision_model_path)
+def cast_frozen_params(model, dtype):
+    """冻结的参数用 bf16/fp16 存（显存减半；autocast 下矩阵乘本来就以半精度计算），可训练参数保持 fp32（优化器更新更稳定）"""
+    for param in model.parameters():
+        param.data = param.data.to(torch.float32 if param.requires_grad else dtype)
+    return model
+
+
+def init_vlm_model(vlm_config, from_weight='pretrain_vlm', tokenizer_path='../model', vision_model_path='../model/siglip2-base-p32-256-ve', save_dir='../out', device='cuda', freeze_llm=0,
+                   llm_path=None, lora_rank=0, grad_checkpoint=False, frozen_dtype=None):
+    """llm_path 为空时用 MiniMind 主干（vlm_config 决定大小）；否则用 llm_path 下的 HF 模型（Qwen 等）做主干。
+    frozen_dtype：冻结参数的存储精度（GPU 上训练 HF 主干时传 bf16），None 表示全部 fp32。"""
+    if lora_rank and not llm_path:
+        raise ValueError('LoRA 用于 --llm_path 指定的大主干；MiniMind 主干参数量小，请直接用 --freeze_llm 0/1')
+    if llm_path:
+        model = HFVLM(llm_path, vision_model_path=vision_model_path, image_special_token=vlm_config.image_special_token,
+                      dtype=frozen_dtype or torch.float32)
+        tokenizer = model.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        model = MiniMindVLM(vlm_config, vision_model_path=vision_model_path)
     if model.vision_encoder is None:
         raise FileNotFoundError(f'未找到视觉编码器: {os.path.abspath(vision_model_path)}，'
                                 f'请先下载 siglip2-base-p32-256-ve（见 README「第0步」或 model/model_init.md）')
 
-    if from_weight != 'none':
-        moe_suffix = '_moe' if vlm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{vlm_config.hidden_size}{moe_suffix}.pth'
-        load_vlm_weights(model, weight_path, device=device)
+    # HF 主干的 'llm' 就是 llm_path 里的基座模型本身，已经加载过了
+    if from_weight != 'none' and not (llm_path and from_weight == 'llm'):
+        load_vlm_weights(model, resolve_weight_path(save_dir, from_weight, model.config), device=device)
 
     # 1、全部冻结，只打开vision_proj梯度
     for name, param in model.named_parameters():
@@ -120,29 +164,44 @@ def init_vlm_model(vlm_config, from_weight='pretrain_vlm', tokenizer_path='../mo
             param.requires_grad = False
 
     # 2、判断策略
+    llm = model.llm if llm_path else model.model
     if freeze_llm == 0:
         for name, param in model.named_parameters():
             if 'vision_encoder' not in name:
                 param.requires_grad = True
     elif freeze_llm == 1:
-        last_idx = vlm_config.num_hidden_layers - 1
-        for name, param in model.model.named_parameters():
+        last_idx = model.config.num_hidden_layers - 1
+        for name, param in llm.named_parameters():
             if 'layers.0.' in name or f'layers.{last_idx}.' in name:
                 param.requires_grad = True
     elif freeze_llm == 2:
         pass
 
-    get_model_params(model, vlm_config)
+    # 3、LoRA：在语言模型的所有线性层上加低秩旁路，只训练旁路
+    if lora_rank:
+        Logger(f'LoRA rank={lora_rank}，作用于 {model.apply_lora(lora_rank)} 个线性层')
+        for name, param in model.named_parameters():
+            if '.lora.' in name:
+                param.requires_grad = True
+
+    if frozen_dtype is not None:
+        cast_frozen_params(model, frozen_dtype)
+    if grad_checkpoint:
+        model.set_grad_checkpointing(True)
+
+    get_model_params(model, model.config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     preprocess = model.processor
+    # from_pretrained 加载的 HF 模型默认是 eval 模式，而 HF 的梯度检查点只在 train 模式下生效，这里统一切到 train 模式
+    # （视觉编码器仍保持 eval，见 VisionTowerMixin.train）
+    model.train()
     return model.to(device), tokenizer, preprocess
 
 
 def vlm_checkpoint(vlm_config, weight='pretrain_vlm', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = '_moe' if vlm_config.use_moe else ''
-    ckp_path = f'{save_dir}/{weight}_{vlm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{vlm_config.hidden_size}{moe_path}_resume.pth'
+    ckp_path = f'{save_dir}/{weight}_{weight_tag(vlm_config)}.pth'
+    resume_path = f'{save_dir}/{weight}_{weight_tag(vlm_config)}_resume.pth'
     
     if model is not None:
         # 移除vision_encoder参数（不需要保存，因为是预训练且冻结的，续训时会从磁盘重新加载）
@@ -238,3 +297,46 @@ class SkipBatchSampler(Sampler):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
 
+
+class LengthGroupedBatchSampler(Sampler):
+    """按长度分组的 batch 采样器（配合 vlm_collate_fn 的动态 padding），支持 DDP 和断点续训。
+
+    每个 epoch：随机打乱 → 每 mega batch（batch_size × 卡数 × mega_batch_mult 条）内按长度排序后切成全局 batch
+    → 打乱全局 batch 的顺序 → 第 i 张卡取全局 batch 的第 i, i+卡数, ... 条。
+    这样同一个 batch 内的样本长度接近（padding 少），同一步各张卡的 batch 长度也接近（不用互相等）。
+    最长的那个 batch 固定放在第一个：显存不够会在开头就报错，而不是跑了几个小时才 OOM。
+    """
+
+    def __init__(self, lengths, batch_size, num_replicas=1, rank=0, seed=42, epoch=0, skip_batches=0, mega_batch_mult=50):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = epoch
+        self.skip_batches = skip_batches
+        self.mega_batch_mult = mega_batch_mult
+
+    def _global_batches(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        global_bs = self.batch_size * self.num_replicas
+        perm = torch.randperm(len(self.lengths), generator=g).tolist()
+        while len(perm) % global_bs:  # 与 DistributedSampler 一样重复开头的样本补齐，保证每张卡的 batch 数相同
+            perm += perm[:global_bs - len(perm) % global_bs]
+        mega = global_bs * self.mega_batch_mult
+        batches = []
+        for i in range(0, len(perm), mega):
+            chunk = sorted(perm[i:i + mega], key=lambda j: self.lengths[j], reverse=True)
+            batches += [chunk[j:j + global_bs] for j in range(0, len(chunk), global_bs)]
+        order = torch.randperm(len(batches), generator=g).tolist()
+        longest = max(range(len(batches)), key=lambda b: self.lengths[batches[b][0]])
+        order.remove(longest)
+        return [batches[b] for b in [longest] + order]
+
+    def __iter__(self):
+        for i, global_batch in enumerate(self._global_batches()):
+            if i >= self.skip_batches:
+                yield global_batch[self.rank::self.num_replicas]
+
+    def __len__(self):
+        return max(0, math.ceil(len(self.lengths) / (self.batch_size * self.num_replicas)) - self.skip_batches)
