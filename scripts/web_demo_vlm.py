@@ -12,6 +12,8 @@ from threading import Thread, Lock
 from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_vlm import MiniMindVLM, VLMConfig
+from model.model_vlm_hf import HFVLM, llm_tag
+from trainer.trainer_utils import load_vlm_weights
 from transformers import logging as hf_logging
 
 hf_logging.set_verbosity_error()
@@ -33,8 +35,27 @@ def scan_vlm_models(base_dir):
     return models
 
 
+def load_hf_backbone_model(llm_path, weight_path):
+    """加载用 --llm_path（Qwen 等）训练的模型：基座模型 + out/ 下训练得到的权重"""
+    global model, tokenizer, preprocess, lm_config, current_model_name
+    with model_lock:
+        model = HFVLM(llm_path, vision_model_path=vision_model_path)
+        if model.vision_encoder is None: raise FileNotFoundError(f"视觉编码器未找到: {vision_model_path}")
+        load_vlm_weights(model, weight_path)
+        tokenizer, preprocess, lm_config = model.tokenizer, model.processor, model.config
+        model = model.eval()
+        if "cuda" in device:  # bf16 推理，只转参数（RoPE 频率等 buffer 保持 fp32）
+            for param in model.parameters(): param.data = param.data.to(torch.bfloat16)
+        model = model.to(device)
+        current_model_name = f'{os.path.basename(os.path.normpath(llm_path))} + {os.path.basename(weight_path)}'
+        print(f'已加载 {current_model_name}')
+        return f"已加载: {current_model_name}"
+
+
 def load_vlm_model(model_path):
     global model, tokenizer, preprocess, lm_config, current_model_name
+    if isinstance(model_path, tuple):  # (llm_path, weight_path)
+        return load_hf_backbone_model(*model_path)
     with model_lock:
         [sys.modules.pop(k) for k in list(sys.modules) if 'transformers_modules' in k]
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -162,12 +183,18 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     parser.add_argument('--max_seq_len', default=8192, type=int, help="最大序列长度")
+    parser.add_argument('--llm_path', default=None, type=str, help="用 --llm_path（如 ../model/Qwen3-0.6B）训练的模型：传同一个基座路径")
+    parser.add_argument('--weight', default=None, type=str, help="配合 --llm_path：训练得到的权重，默认 ../out/sft_vlm_{主干名}.pth")
     args = parser.parse_args()
 
     device = args.device
     max_seq_len = args.max_seq_len
     vision_model_path = args.vision_model
-    model_dict = scan_vlm_models(args.load_from)
+    if args.llm_path:
+        weight_path = args.weight or f'../out/sft_vlm_{llm_tag(args.llm_path)}.pth'
+        model_dict = {f'{os.path.basename(os.path.normpath(args.llm_path))}-VLM': (args.llm_path, weight_path)}
+    else:
+        model_dict = scan_vlm_models(args.load_from)
     if not model_dict:
         print(f"未在 {os.path.abspath(args.load_from)} 找到transformers模型")
         exit(1)

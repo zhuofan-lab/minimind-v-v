@@ -7,13 +7,18 @@ import random
 from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_vlm import MiniMindVLM, VLMConfig
-from trainer.trainer_utils import setup_seed, get_model_params, load_vlm_weights
+from model.model_vlm_hf import HFVLM
+from trainer.trainer_utils import setup_seed, get_model_params, load_vlm_weights, resolve_weight_path
 warnings.filterwarnings('ignore')
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from, trust_remote_code=True)
-    if os.path.basename(os.path.normpath(args.load_from)) == 'model':
+    if args.llm_path:  # HF 主干（Qwen 等）：先加载基座模型，再叠加训练得到的权重（out/{weight}_{主干名}.pth）
+        model = HFVLM(args.llm_path, vision_model_path=args.vision_model)
+        tokenizer = model.tokenizer
+        load_vlm_weights(model, resolve_weight_path(args.save_dir, args.weight, model.config), device='cpu')
+    elif os.path.basename(os.path.normpath(args.load_from)) == 'model':
+        tokenizer = AutoTokenizer.from_pretrained(args.load_from, trust_remote_code=True)
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model = MiniMindVLM(
@@ -22,6 +27,7 @@ def init_model(args):
         )
         load_vlm_weights(model, ckp, device=args.device)
     else:
+        tokenizer = AutoTokenizer.from_pretrained(args.load_from, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
         model.vision_encoder, model.processor = MiniMindVLM.get_vision_model(args.vision_model)
     if model.vision_encoder is None:
@@ -29,7 +35,11 @@ def init_model(args):
                                 f'请先下载 siglip2-base-p32-256-ve（见 README「第0步」或 model/model_init.md）')
     get_model_params(model, model.config)
     model = model.eval()
-    if "cuda" in args.device: model = model.half()
+    if "cuda" in args.device:
+        if args.llm_path:  # Qwen 等模型用 bf16 推理（fp16 可能溢出）；只转参数，RoPE 频率等 buffer 保持 fp32
+            for param in model.parameters(): param.data = param.data.to(torch.bfloat16)
+        else:
+            model = model.half()
     return model.to(args.device), tokenizer, model.processor
 
 
@@ -48,6 +58,7 @@ def main():
     parser.add_argument('--image', default=None, type=str, help="只测试单张图像（指定后忽略 --image_dir）")
     parser.add_argument('--prompt', default="<image>\n请描述这张图中的主要物体和场景。", type=str, help="提问内容，<image> 为图像插入位置（缺省时自动加在开头）")
     parser.add_argument('--vision_model', default='./model/siglip2-base-p32-256-ve', type=str, help="视觉编码器路径")
+    parser.add_argument('--llm_path', default=None, type=str, help="训练时用 --llm_path 指定了 HF 主干（如 ./model/Qwen3-0.6B）时，这里传同一个路径")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
@@ -70,7 +81,9 @@ def main():
         pixel_values = {k: v.to(args.device) for k, v in MiniMindVLM.image2tensor(image, preprocess).items()}
 
         messages = [{"role": "user", "content": prompt.replace('<image>', model.config.image_special_token * model.config.image_token_len)}]
-        inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
+        # open_thinking 对应 MiniMind 的模板，enable_thinking 对应 Qwen3 的模板，其他模板会忽略这两个参数
+        inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                    open_thinking=bool(args.open_thinking), enable_thinking=bool(args.open_thinking))
         inputs = tokenizer(inputs_text, return_tensors="pt", truncation=True).to(args.device)
 
         print(f'[图像]: {image_file}')
