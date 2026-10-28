@@ -62,16 +62,58 @@ def image_bytes(color=(200, 30, 30), mode='RGB', size=(80, 60), fmt='JPEG'):
     return buf.getvalue()
 
 
-def write_parquet(path, samples):
+def write_parquet(path, samples, ensure_ascii=False):
     """samples: [(conversations, image_bytes), ...]，格式与官方 pretrain/sft parquet 一致。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
     table = pa.table({
-        'conversations': [json.dumps(conv, ensure_ascii=False) for conv, _ in samples],
+        'conversations': [json.dumps(conv, ensure_ascii=ensure_ascii) for conv, _ in samples],
         'image_bytes': [img for _, img in samples],
     })
     pq.write_table(table, path)
     return str(path)
+
+
+QWEN25_LIKE_TEMPLATE = (
+    "{%- if messages[0]['role'] == 'system' %}{{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}"
+    "{%- else %}{{- '<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n' }}{%- endif %}"
+    "{%- for message in messages %}{%- if not (message.role == 'system' and loop.first) %}"
+    "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}{%- endif %}{%- endfor %}"
+    "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+)
+
+
+def save_tiny_llm(path, arch='qwen3', template='minimind'):
+    """随机初始化的迷你 Qwen3/Qwen2 + ChatML tokenizer，模拟 ../model/Qwen3-0.6B 这样的 HF 模型目录。
+
+    template='qwen25' 时模拟 Qwen2.5 tokenizer 的特点：bos_token 为 None、eos_token 为 <|endoftext|>（基座模型），
+    并且没有 system 消息时模板会自动加默认的 system prompt。
+    """
+    from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen3Config, Qwen3ForCausalLM
+    tok = AutoTokenizer.from_pretrained(os.path.join(REPO_ROOT, 'model'))
+    if template == 'qwen25':
+        tok.bos_token = None
+        tok.eos_token = '<|endoftext|>'
+        tok.chat_template = QWEN25_LIKE_TEMPLATE
+    elif template == 'llama3':
+        tok.chat_template = "{% for m in messages %}<|start_header_id|>{{ m.role }}<|end_header_id|>\n\n{{ m.content }}<|eot_id|>{% endfor %}"
+    common = dict(hidden_size=64, intermediate_size=128, num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+                  vocab_size=len(tok), tie_word_embeddings=True, max_position_embeddings=2048)
+    torch.manual_seed(1)
+    model = Qwen3ForCausalLM(Qwen3Config(head_dim=16, **common)) if arch == 'qwen3' else Qwen2ForCausalLM(Qwen2Config(**common))
+    model.save_pretrained(path)
+    tok.save_pretrained(path)
+    return str(path)
+
+
+@pytest.fixture(scope='session')
+def tiny_qwen3_path(tmp_path_factory):
+    return save_tiny_llm(tmp_path_factory.mktemp('llm') / 'Qwen3-Tiny', arch='qwen3', template='minimind')
+
+
+@pytest.fixture(scope='session')
+def tiny_qwen25_path(tmp_path_factory):
+    return save_tiny_llm(tmp_path_factory.mktemp('llm') / 'Qwen2.5-Tiny-Base', arch='qwen2', template='qwen25')
 
 
 @pytest.fixture(autouse=True)
