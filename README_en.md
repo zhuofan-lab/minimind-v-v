@@ -33,7 +33,7 @@
 </div>
 
 > [!NOTE]
-> This repository is a fork of [jingyaogong/minimind-v](https://github.com/jingyaogong/minimind-v). Without changing the model architecture or weight format, it fixes several bugs (training crashes on non-RGB images, errors with adjacent multi-image prompts, etc.), adds dynamic padding and a CPU test suite. See [docs/IMPROVEMENTS.md](./docs/IMPROVEMENTS.md) (Chinese) for the full list and further ideas.
+> This repository is a fork of [jingyaogong/minimind-v](https://github.com/jingyaogong/minimind-v). Without changing the model architecture or weight format, it fixes several bugs (training crashes on non-RGB images, errors with adjacent multi-image prompts, etc.), adds dynamic padding and a CPU test suite. See [docs/IMPROVEMENTS.md](./docs/IMPROVEMENTS.md) (Chinese) for the full list and further ideas, and [docs/SCALING.md](./docs/SCALING.md) (Chinese) for using a Qwen backbone or a larger MiniMind and training on 8×RTX 3090.
 
 * This project aims to train a super-small multimodal vision-language model, **MiniMind-V**, with just a cost of 3 RMB
   and 2 hours of work, starting from scratch!

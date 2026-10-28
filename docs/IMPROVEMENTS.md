@@ -3,6 +3,8 @@
 本仓库基于上游 [jingyaogong/minimind-v](https://github.com/jingyaogong/minimind-v)（`041d528`，2026-10-27）。
 改动只涉及代码健壮性、训练效率和工程化，**模型结构、默认超参数和已发布权重的格式都没有变**，上游的 `*.pth` 权重可以直接使用。
 
+**加大模型（Qwen 主干 / 更大的 MiniMind）和 8 卡训练的说明见 [SCALING.md](./SCALING.md)。**
+
 ## 一、已完成的改动
 
 ### 修复的问题
@@ -54,14 +56,27 @@ pip install pytest
 pytest tests -q
 ```
 
+### 第二轮：加大模型、多卡训练（详见 [SCALING.md](./SCALING.md)）
+
+- **Qwen 主干**（`--llm_path`）：`model/model_vlm_hf.py` 把 Qwen2.5 / Qwen3 等 ChatML 格式的 HF 模型接到同一套视觉编码器和投影层上；只在回答位置分块计算 logits（Qwen 词表 15 万，完整 logits 会撑爆 3090）；冻结参数用 bf16 存；权重只保存与基座不同的部分（投影层、训练过的层、LoRA）。
+- **LoRA**（`--lora_rank`）：手写的 LoRA（forward hook 实现，参数名不变），加载权重时自动识别秩。
+- **梯度检查点**（`--grad_checkpoint`）：MiniMind 和 Qwen 主干都支持，开关前后 loss 和梯度完全一致。
+- **按长度分组采样**（`--group_by_length`）：DDP 下各卡同一步的 batch 长度接近，支持断点续训；样本长度用 pyarrow 向量化估算（不分词，几百万条几秒钟），与真实 token 数相差在 ±20% 以内。
+- **多卡**：梯度累积的中间步跳过 DDP 同步；`gradient_as_bucket_view` 省掉一份梯度副本；不再每步广播 buffer；没有 GPU 时自动用 gloo，可以在 CPU 上用 torchrun 调试多卡逻辑。
+- **数据**：回答片段的定位改用 ChatML 标记，兼容 bos_token 为 None 的 Qwen tokenizer；视觉 token 数和特征维度从视觉编码器自动读取（`--vision_model` 可换编码器）。
+- **脚本**：`scripts/bench_vlm.py` 在自己的卡上测显存和速度、估算 epoch 耗时；`eval_vlm.py` 和 WebUI 支持 `--llm_path`。
+- **测试**：新增 32 个测试，包括用 torchrun 起 2 个 CPU 进程跑真实训练脚本（DDP + 梯度累积 + 分组采样 + 断点续训，Qwen 主干 + LoRA + 梯度检查点）。
+
 ## 二、还可以继续改进的方向
 
 下面这些需要 GPU 和真实数据来验证效果，没有直接改进代码里：
 
-1. **按长度分组采样**（类似 `group_by_length`）：配合动态 padding 能省下更多计算。Pretrain 默认 `batch_size=16`，batch 内最长的样本往往接近上限，单靠裁剪省得有限。
+1. ~~按长度分组采样~~：已实现（`--group_by_length 1`）。
 2. **用 `<|vision_start|>` / `<|vision_end|>` 包住图像 token**：tokenizer 里已经有这两个特殊 token 但没有用上，加上后模型能明确知道图像边界，多图时尤其有用（需要重新训练，和已发布权重不兼容）。
 3. **更高的分辨率 + token 压缩**：目前 256×256 只有 64 个视觉 token，对文档、图表类问题（ALLaVA-VFLAN 里不少）细节不够。可以换 384 分辨率的编码器，再用 2×2 pixel-shuffle（InternVL）或 PatchMerger（Qwen2-VL）把 token 数压回去，或者参考 LLaVA-NeXT 的 AnyRes 做动态分辨率切块。
-4. **LoRA 微调 LLM 中间层**：`freeze_llm=1` 只解冻首尾两层，LoRA 能在不明显损伤语言能力的前提下提供更多可训练容量。
+4. ~~LoRA~~：已在 Qwen 主干上实现（`--lora_rank`）；MiniMind 主干参数量小，直接全参或解冻首尾层即可。
+9. **FSDP / ZeRO**：1.5B 以上的主干全参训练需要把参数、梯度和优化器状态切分到多张卡上。
+10. **Qwen 主干导出为独立的 transformers 格式**：目前推理需要基座目录 + 增量权重。
 5. **纯文本样本跳过视觉编码**：SFT 中约 23 万条纯文本对话用 8×8 黑图占位，视觉编码器仍然会把它们编码一遍，可以跳过。
 6. **定量评测**：目前只靠 6 张图主观看效果，可以加一个固定的验证集算 val loss，以及 POPE（幻觉）、MMBench 等基准的评测脚本。
 7. **Web Demo 多轮对话**：现在每轮对话相互独立，上传图片后追问时模型既看不到之前的图片也看不到之前的对话。
